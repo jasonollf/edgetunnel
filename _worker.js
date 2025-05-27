@@ -11,7 +11,7 @@ let subEmoji = 'true';
 let socks5Address = '';
 let parsedSocks5Address = {};
 let enableSocks = false;
-
+let enableHttp = false;
 let noTLS = 'false';
 const expire = 4102329600;//2099-12-31
 let proxyIPs;
@@ -89,9 +89,10 @@ export default {
 			proxyIPs = await 整理(proxyIP);
 			proxyIP = proxyIPs[Math.floor(Math.random() * proxyIPs.length)];
 
-			socks5Address = env.SOCKS5 || socks5Address;
+			socks5Address = env.HTTP || env.SOCKS5 || socks5Address;
 			socks5s = await 整理(socks5Address);
 			socks5Address = socks5s[Math.floor(Math.random() * socks5s.length)];
+			enableHttp = env.HTTP ? true : socks5Address.toLowerCase().includes('http://');
 			socks5Address = socks5Address.split('//')[1] || socks5Address;
 			if (env.GO2SOCKS5) go2Socks5s = await 整理(env.GO2SOCKS5);
 			if (env.CFPORTS) httpsPorts = await 整理(env.CFPORTS);
@@ -210,7 +211,8 @@ export default {
 			} else {
 				socks5Address = url.searchParams.get('socks5') || socks5Address;
 				if (new RegExp('/socks5=', 'i').test(url.pathname)) socks5Address = url.pathname.split('5=')[1];
-				else if (new RegExp('/socks://', 'i').test(url.pathname) || new RegExp('/socks5://', 'i').test(url.pathname)) {
+				else if (new RegExp('/socks://', 'i').test(url.pathname) || new RegExp('/socks5://', 'i').test(url.pathname) || new RegExp('/http://', 'i').test(url.pathname)) {
+					enableHttp = url.pathname.includes('http://');
 					socks5Address = url.pathname.split('://')[1].split('#')[0];
 					if (socks5Address.includes('@')) {
 						let userPassword = socks5Address.split('@')[0].replaceAll('%3D', '=');
@@ -373,15 +375,14 @@ async function handleTCPOutBound(remoteSocket, addressType, addressRemote, portR
 		});
 	}
 
-	async function connectAndWrite(address, port, socks = false) {
+	async function connectAndWrite(address, port, socks = false, http = false) {
 		log(`connected to ${address}:${port}`);
 		//if (/^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?).){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/.test(address)) address = `${atob('d3d3Lg==')}${address}${atob('LmlwLjA5MDIyNy54eXo=')}`;
-		// 如果指定使用 SOCKS5 代理，则通过 SOCKS5 协议连接；否则直接连接
-		const tcpSocket = socks ? await socks5Connect(addressType, address, port, log)
-			: connect({
-				hostname: address,
-				port: port,
-			});
+		// 先确定连接方式，再创建连接
+		const tcpSocket = socks
+			? (http ? await httpConnect(address, port, log) : await socks5Connect(addressType, address, port, log))
+			: connect({ hostname: address, port: port });
+
 		remoteSocket.value = tcpSocket;
 		//log(`connected to ${address}:${port}`);
 		const writer = tcpSocket.writable.getWriter();
@@ -391,6 +392,20 @@ async function handleTCPOutBound(remoteSocket, addressType, addressRemote, portR
 		return tcpSocket;
 	}
 
+	async function nat64() {
+		if (!useSocks) {
+			const nat64Proxyip = `[${await resolveToIPv6(addressRemote)}]`;
+			log(`NAT64 代理连接到 ${nat64Proxyip}:443`);
+			tcpSocket = await connectAndWrite(nat64Proxyip, '443');
+		}
+		tcpSocket.closed.catch(error => {
+			console.log('retry tcpSocket closed error', error);
+		}).finally(() => {
+			safeCloseWebSocket(webSocket);
+		})
+		remoteSocketToWS(tcpSocket, webSocket, 维列斯ResponseHeader, null, log);
+	}
+
 	/**
 	 * 重试函数：当 Cloudflare 的 TCP Socket 没有传入数据时，我们尝试重定向 IP
 	 * 这可能是因为某些网络问题导致的连接失败
@@ -398,7 +413,7 @@ async function handleTCPOutBound(remoteSocket, addressType, addressRemote, portR
 	async function retry() {
 		if (enableSocks) {
 			// 如果启用了 SOCKS5，通过 SOCKS5 代理重试连接
-			tcpSocket = await connectAndWrite(addressRemote, portRemote, true);
+			tcpSocket = await connectAndWrite(addressRemote, portRemote, true, enableHttp);
 		} else {
 			// 否则，尝试使用预设的代理 IP（如果有）或原始地址重试连接
 			if (!proxyIP || proxyIP == '') {
@@ -413,20 +428,21 @@ async function handleTCPOutBound(remoteSocket, addressType, addressRemote, portR
 			if (proxyIP.includes('.tp')) portRemote = proxyIP.split('.tp')[1].split('.')[0] || portRemote;
 			tcpSocket = await connectAndWrite(proxyIP.toLowerCase() || addressRemote, portRemote);
 		}
-		// 无论重试是否成功，都要关闭 WebSocket（可能是为了重新建立连接）
+		/* 无论重试是否成功，都要关闭 WebSocket（可能是为了重新建立连接）
 		tcpSocket.closed.catch(error => {
 			console.log('retry tcpSocket closed error', error);
 		}).finally(() => {
 			safeCloseWebSocket(webSocket);
 		})
+		*/
 		// 建立从远程 Socket 到 WebSocket 的数据流
-		remoteSocketToWS(tcpSocket, webSocket, 维列斯ResponseHeader, null, log);
+		remoteSocketToWS(tcpSocket, webSocket, 维列斯ResponseHeader, nat64, log);
 	}
 
 	let useSocks = false;
 	if (go2Socks5s.length > 0 && enableSocks) useSocks = await useSocks5Pattern(addressRemote);
 	// 首次尝试连接远程服务器
-	let tcpSocket = await connectAndWrite(addressRemote, portRemote, useSocks);
+	let tcpSocket = await connectAndWrite(addressRemote, portRemote, useSocks, enableHttp);
 
 	// 当远程 Socket 就绪时，将其传递给 WebSocket
 	// 建立从远程服务器到 WebSocket 的数据流，用于将远程服务器的响应发送回客户端
@@ -1050,6 +1066,123 @@ async function socks5Connect(addressType, addressRemote, portRemote, log) {
 }
 
 /**
+ * 建立 HTTP 代理连接
+ * @param {string} addressRemote 目标地址（可以是 IP 或域名）
+ * @param {number} portRemote 目标端口
+ * @param {function} log 日志记录函数
+ */
+async function httpConnect(addressRemote, portRemote, log) {
+	const { username, password, hostname, port } = parsedSocks5Address;
+	const sock = await connect({
+		hostname: hostname,
+		port: port
+	});
+
+	// 构建HTTP CONNECT请求
+	let connectRequest = `CONNECT ${addressRemote}:${portRemote} HTTP/1.1\r\n`;
+	connectRequest += `Host: ${addressRemote}:${portRemote}\r\n`;
+
+	// 添加代理认证（如果需要）
+	if (username && password) {
+		const authString = `${username}:${password}`;
+		const base64Auth = btoa(authString);
+		connectRequest += `Proxy-Authorization: Basic ${base64Auth}\r\n`;
+	}
+
+	connectRequest += `User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36\r\n`;
+	connectRequest += `Proxy-Connection: Keep-Alive\r\n`;
+	connectRequest += `Connection: Keep-Alive\r\n`; // 添加标准 Connection 头
+	connectRequest += `\r\n`;
+
+	log(`正在连接到 ${addressRemote}:${portRemote} 通过代理 ${hostname}:${port}`);
+
+	try {
+		// 发送连接请求
+		const writer = sock.writable.getWriter();
+		await writer.write(new TextEncoder().encode(connectRequest));
+		writer.releaseLock();
+	} catch (err) {
+		console.error('发送HTTP CONNECT请求失败:', err);
+		throw new Error(`发送HTTP CONNECT请求失败: ${err.message}`);
+	}
+
+	// 读取HTTP响应
+	const reader = sock.readable.getReader();
+	let respText = '';
+	let connected = false;
+	let responseBuffer = new Uint8Array(0);
+
+	try {
+		while (true) {
+			const { value, done } = await reader.read();
+			if (done) {
+				console.error('HTTP代理连接中断');
+				throw new Error('HTTP代理连接中断');
+			}
+
+			// 合并接收到的数据
+			const newBuffer = new Uint8Array(responseBuffer.length + value.length);
+			newBuffer.set(responseBuffer);
+			newBuffer.set(value, responseBuffer.length);
+			responseBuffer = newBuffer;
+
+			// 将收到的数据转换为文本
+			respText = new TextDecoder().decode(responseBuffer);
+
+			// 检查是否收到完整的HTTP响应头
+			if (respText.includes('\r\n\r\n')) {
+				// 分离HTTP头和可能的数据部分
+				const headersEndPos = respText.indexOf('\r\n\r\n') + 4;
+				const headers = respText.substring(0, headersEndPos);
+
+				log(`收到HTTP代理响应: ${headers.split('\r\n')[0]}`);
+
+				// 检查响应状态
+				if (headers.startsWith('HTTP/1.1 200') || headers.startsWith('HTTP/1.0 200')) {
+					connected = true;
+
+					// 如果响应头之后还有数据，我们需要保存这些数据以便后续处理
+					if (headersEndPos < responseBuffer.length) {
+						const remainingData = responseBuffer.slice(headersEndPos);
+						// 创建一个缓冲区来存储这些数据，以便稍后使用
+						const dataStream = new ReadableStream({
+							start(controller) {
+								controller.enqueue(remainingData);
+							}
+						});
+
+						// 创建一个新的TransformStream来处理额外数据
+						const { readable, writable } = new TransformStream();
+						dataStream.pipeTo(writable).catch(err => console.error('处理剩余数据错误:', err));
+
+						// 替换原始readable流
+						// @ts-ignore
+						sock.readable = readable;
+					}
+				} else {
+					const errorMsg = `HTTP代理连接失败: ${headers.split('\r\n')[0]}`;
+					console.error(errorMsg);
+					throw new Error(errorMsg);
+				}
+				break;
+			}
+		}
+	} catch (err) {
+		reader.releaseLock();
+		throw new Error(`处理HTTP代理响应失败: ${err.message}`);
+	}
+
+	reader.releaseLock();
+
+	if (!connected) {
+		throw new Error('HTTP代理连接失败: 未收到成功响应');
+	}
+
+	log(`HTTP代理连接成功: ${addressRemote}:${portRemote}`);
+	return sock;
+}
+
+/**
  * SOCKS5 代理地址解析器
  * 此函数用于解析 SOCKS5 代理地址字符串，提取出用户名、密码、主机名和端口号
  * 
@@ -1356,20 +1489,20 @@ async function 生成配置信息(userID, hostName, sub, UA, RproxyIP, _url, fak
 
 		let socks5List = '';
 		if (go2Socks5s.length > 0 && enableSocks) {
-			socks5List = `${decodeURIComponent('SOCKS5%EF%BC%88%E7%99%BD%E5%90%8D%E5%8D%95%EF%BC%89%3A%20')}`;
+			socks5List = `${(enableHttp ? "HTTP" : "Socks5") + decodeURIComponent('%EF%BC%88%E7%99%BD%E5%90%8D%E5%8D%95%EF%BC%89%3A%20')}`;
 			if (go2Socks5s.includes(atob('YWxsIGlu')) || go2Socks5s.includes(atob('Kg=='))) socks5List += `${decodeURIComponent('%E6%89%80%E6%9C%89%E6%B5%81%E9%87%8F')}<br>`;
 			else socks5List += `<br>&nbsp;&nbsp;${go2Socks5s.join('<br>&nbsp;&nbsp;')}<br>`;
 		}
 
 		let 订阅器 = '<br>';
 		if (sub) {
-			if (enableSocks) 订阅器 += `CFCDN（访问方式）: Socks5<br>&nbsp;&nbsp;${newSocks5s.join('<br>&nbsp;&nbsp;')}<br>${socks5List}`;
+			if (enableSocks) 订阅器 += `CFCDN（访问方式）: ${enableHttp ? "HTTP" : "Socks5"}<br>&nbsp;&nbsp;${newSocks5s.join('<br>&nbsp;&nbsp;')}<br>${socks5List}`;
 			else if (proxyIP && proxyIP != '') 订阅器 += `CFCDN（访问方式）: ProxyIP<br>&nbsp;&nbsp;${proxyIPs.join('<br>&nbsp;&nbsp;')}<br>`;
 			else if (RproxyIP == 'true') 订阅器 += `CFCDN（访问方式）: 自动获取ProxyIP<br>`;
 			else 订阅器 += `CFCDN（访问方式）: 无法访问, 需要您设置 proxyIP/PROXYIP ！！！<br>`
 			订阅器 += `<br>SUB（优选订阅生成器）: ${sub}`;
 		} else {
-			if (enableSocks) 订阅器 += `CFCDN（访问方式）: Socks5<br>&nbsp;&nbsp;${newSocks5s.join('<br>&nbsp;&nbsp;')}<br>${socks5List}`;
+			if (enableSocks) 订阅器 += `CFCDN（访问方式）: ${enableHttp ? "HTTP" : "Socks5"}<br>&nbsp;&nbsp;${newSocks5s.join('<br>&nbsp;&nbsp;')}<br>${socks5List}`;
 			else if (proxyIP && proxyIP != '') 订阅器 += `CFCDN（访问方式）: ProxyIP<br>&nbsp;&nbsp;${proxyIPs.join('<br>&nbsp;&nbsp;')}<br>`;
 			else 订阅器 += `CFCDN（访问方式）: 无法访问, 需要您设置 proxyIP/PROXYIP ！！！<br>`;
 			let 判断是否绑定KV空间 = '';
@@ -2220,5 +2353,193 @@ async function KV(request, env, txt = 'ADD.txt') {
 			status: 500,
 			headers: { "Content-Type": "text/plain;charset=utf-8" }
 		});
+	}
+}
+
+async function resolveToIPv6(target) {
+	// 检查是否为IPv4
+	function isIPv4(str) {
+		const parts = str.split('.');
+		return parts.length === 4 && parts.every(part => {
+			const num = parseInt(part, 10);
+			return num >= 0 && num <= 255 && part === num.toString();
+		});
+	}
+
+	// 检查是否为IPv6
+	function isIPv6(str) {
+		return str.includes(':') && /^[0-9a-fA-F:]+$/.test(str);
+	}
+
+	// 获取域名的IPv4地址
+	async function fetchIPv4(domain) {
+		const url = `https://cloudflare-dns.com/dns-query?name=${domain}&type=A`;
+		const response = await fetch(url, {
+			headers: { 'Accept': 'application/dns-json' }
+		});
+
+		if (!response.ok) throw new Error('DNS查询失败');
+
+		const data = await response.json();
+		const ipv4s = (data.Answer || [])
+			.filter(record => record.type === 1)
+			.map(record => record.data);
+
+		if (ipv4s.length === 0) throw new Error('未找到IPv4地址');
+		return ipv4s[Math.floor(Math.random() * ipv4s.length)];
+	}
+
+	// 查询NAT64 IPv6地址
+	async function queryNAT64(domain) {
+		const socket = connect(atob('ZG90Lm5hdDY0LmRrOjg1Mw=='), {
+			secureTransport: 'on',
+			allowHalfOpen: false
+		});
+
+		const writer = socket.writable.getWriter();
+		const reader = socket.readable.getReader();
+
+		try {
+			// 发送DNS查询
+			const query = buildDNSQuery(domain);
+			const queryWithLength = new Uint8Array(query.length + 2);
+			queryWithLength[0] = query.length >> 8;
+			queryWithLength[1] = query.length & 0xFF;
+			queryWithLength.set(query, 2);
+			await writer.write(queryWithLength);
+
+			// 读取响应
+			const response = await readDNSResponse(reader);
+			const ipv6s = parseIPv6(response);
+
+			return ipv6s.length > 0 ? ipv6s[0] : '未找到IPv6地址';
+		} finally {
+			await writer.close();
+			await reader.cancel();
+		}
+	}
+
+	// 构建DNS查询包
+	function buildDNSQuery(domain) {
+		const buffer = new ArrayBuffer(512);
+		const view = new DataView(buffer);
+		let offset = 0;
+
+		// DNS头部
+		view.setUint16(offset, Math.floor(Math.random() * 65536)); offset += 2; // ID
+		view.setUint16(offset, 0x0100); offset += 2; // 标志
+		view.setUint16(offset, 1); offset += 2; // 问题数
+		view.setUint16(offset, 0); offset += 6; // 答案数/权威数/附加数
+
+		// 域名编码
+		for (const label of domain.split('.')) {
+			view.setUint8(offset++, label.length);
+			for (let i = 0; i < label.length; i++) {
+				view.setUint8(offset++, label.charCodeAt(i));
+			}
+		}
+		view.setUint8(offset++, 0); // 结束标记
+
+		// 查询类型和类
+		view.setUint16(offset, 28); offset += 2; // AAAA记录
+		view.setUint16(offset, 1); offset += 2; // IN类
+
+		return new Uint8Array(buffer, 0, offset);
+	}
+
+	// 读取DNS响应
+	async function readDNSResponse(reader) {
+		const chunks = [];
+		let totalLength = 0;
+		let expectedLength = null;
+
+		while (true) {
+			const { value, done } = await reader.read();
+			if (done) break;
+
+			chunks.push(value);
+			totalLength += value.length;
+
+			if (expectedLength === null && totalLength >= 2) {
+				expectedLength = (chunks[0][0] << 8) | chunks[0][1];
+			}
+
+			if (expectedLength !== null && totalLength >= expectedLength + 2) {
+				break;
+			}
+		}
+
+		// 合并数据并跳过长度前缀
+		const fullResponse = new Uint8Array(totalLength);
+		let offset = 0;
+		for (const chunk of chunks) {
+			fullResponse.set(chunk, offset);
+			offset += chunk.length;
+		}
+
+		return fullResponse.slice(2);
+	}
+
+	// 解析IPv6地址
+	function parseIPv6(response) {
+		const view = new DataView(response.buffer);
+		let offset = 12; // 跳过DNS头部
+
+		// 跳过问题部分
+		while (view.getUint8(offset) !== 0) {
+			offset += view.getUint8(offset) + 1;
+		}
+		offset += 5;
+
+		const answers = [];
+		const answerCount = view.getUint16(6); // 答案数量
+
+		for (let i = 0; i < answerCount; i++) {
+			// 跳过名称
+			if ((view.getUint8(offset) & 0xC0) === 0xC0) {
+				offset += 2;
+			} else {
+				while (view.getUint8(offset) !== 0) {
+					offset += view.getUint8(offset) + 1;
+				}
+				offset++;
+			}
+
+			const type = view.getUint16(offset); offset += 2;
+			offset += 6; // 跳过类和TTL
+			const dataLength = view.getUint16(offset); offset += 2;
+
+			if (type === 28 && dataLength === 16) { // AAAA记录
+				const parts = [];
+				for (let j = 0; j < 8; j++) {
+					parts.push(view.getUint16(offset + j * 2).toString(16));
+				}
+				answers.push(parts.join(':'));
+			}
+			offset += dataLength;
+		}
+
+		return answers;
+	}
+
+	try {
+		// 判断输入类型并处理
+		if (isIPv6(target)) {
+			return target; // IPv6直接返回
+		}
+
+		let domain;
+		if (isIPv4(target)) {
+			domain = target + atob('LmlwLjA5MDIyNy54eXo='); // IPv4转换为NAT64域名
+		} else {
+			// 域名先解析IPv4再转NAT64
+			const ipv4 = await fetchIPv4(target);
+			domain = ipv4 + atob('LmlwLjA5MDIyNy54eXo=');
+		}
+
+		return await queryNAT64(domain);
+	} catch (error) {
+		console.error('解析错误:', error);
+		return `解析失败: ${error.message}`;
 	}
 }
